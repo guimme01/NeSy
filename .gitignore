@@ -1,0 +1,18 @@
+# Dataset (huge, not tracked)
+Exp2/
+*.zip
+
+# Processed cache / model artifacts
+*.pkl
+checkpoints/
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Env / IDE
+.venv/
+.vscode/
+.idea/
