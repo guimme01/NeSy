@@ -38,7 +38,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, confusion_matrix,
+    roc_auc_score, confusion_matrix, balanced_accuracy_score,
 )
 from scipy import stats
 from typing import List, Tuple, Optional, Dict
@@ -266,22 +266,22 @@ def load_and_cache_dataset(base_dir: str, subjects: List[str], cache_path: str) 
     y_labels = np.concatenate(all_labels, axis=0)
     x_subjects = np.array(all_subjects)
 
-    # Dataset-level median imputation for current-window HRV.
+    # NO dataset-level imputation here: computing medians over ALL subjects (train+val)
+    # before the split leaked validation info. Missing values are kept as NaN and imputed
+    # PER-FOLD with TRAIN-only medians in standardize_hrv_per_fold (leakage-free).
     merged_hrv = pd.concat(all_hrv_dfs, axis=0, ignore_index=True).replace([np.inf, -np.inf], np.nan)
-    median_values = merged_hrv.median()
-    merged_hrv = merged_hrv.fillna(median_values).fillna(0.0)
-    x_hrv = merged_hrv.values.astype(np.float32)
     hrv_feature_names = list(merged_hrv.columns)
+    x_hrv = merged_hrv.values.astype(np.float32)  # RAW (contains NaN)
 
-    # Align each subject's baseline Series to the WINDOW feature columns (adds missing
-    # columns as NaN, drops extras), tile per window, then apply the same imputation.
+    # Align each subject's baseline Series to the WINDOW feature columns (missing -> NaN);
+    # kept RAW here and imputed per-fold together with the current-window HRV.
     baseline_rows = []
     for series, n_wins in zip(all_baseline_series, all_nwins):
         row = series.reindex(hrv_feature_names).to_numpy(dtype=np.float32)
         baseline_rows.append(np.tile(row, (n_wins, 1)))
     df_base = pd.DataFrame(np.concatenate(baseline_rows, axis=0), columns=hrv_feature_names)
-    df_base = df_base.replace([np.inf, -np.inf], np.nan).fillna(median_values).fillna(0.0)
-    x_baselines = df_base.values.astype(np.float32)
+    df_base = df_base.replace([np.inf, -np.inf], np.nan)
+    x_baselines = df_base.values.astype(np.float32)  # RAW (contains NaN)
 
     dataset_dict = {
         "x_spectrograms": x_spectrograms,
@@ -377,7 +377,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, model_type):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, model_type):
+def evaluate(model, loader, device, model_type, subject_ids=None):
     model.eval()
     preds, probs, targets = [], [], []
     for batch in loader:
@@ -386,7 +386,32 @@ def evaluate(model, loader, device, model_type):
         preds.extend(logits.argmax(1).cpu().numpy())
         probs.extend(p[:, 1].cpu().numpy())
         targets.extend(labels.cpu().numpy())
-    return np.array(preds), np.array(probs), np.array(targets)
+    preds, probs, targets = np.array(preds), np.array(probs), np.array(targets)
+    # SUPPLEMENTARY (additive): return the subject ID for each validation window.
+    # The val loader uses shuffle=False, so window order matches the passed val indices.
+    # The three existing outputs (preds/probs/targets) are unchanged.
+    subj = None
+    if subject_ids is not None:
+        subj = np.asarray(subject_ids)
+        assert len(subj) == len(targets), "subject_ids must align 1:1 with val windows"
+    return preds, probs, targets, subj
+
+
+def aggregate_by_subject(labels, probs, subject_ids):
+    """
+    SUPPLEMENTARY subject-level aggregation. For each subject, average all its window
+    probabilities into one subject-level probability, and keep its single ground-truth
+    label. Returns (subject_probs, subject_labels). Does not touch window-level metrics.
+    """
+    labels = np.asarray(labels)
+    probs = np.asarray(probs)
+    subject_ids = np.asarray(subject_ids)
+    subj_probs, subj_labels = [], []
+    for s in np.unique(subject_ids):
+        mask = subject_ids == s
+        subj_probs.append(probs[mask].mean())   # mean window probability for this subject
+        subj_labels.append(labels[mask][0])      # one label per subject (constant within subject)
+    return np.array(subj_probs), np.array(subj_labels)
 
 
 def expected_calibration_error(probs, targets, n_bins: int = 10) -> float:
@@ -430,14 +455,22 @@ def corrected_paired_ttest(diffs) -> Tuple[float, float]:
 
 
 def metrics(targets, preds, probs) -> Dict[str, float]:
+    """
+    Balance-robust, SYMMETRIC metrics. The previous positive-class-only precision/recall/F1
+    (sklearn default pos_label=1) measured only the ST/high-load class and was confounded by
+    each fold's class balance and the model's tendency to over-predict positives. We report
+    instead: balanced accuracy (mean per-class recall), macro-F1 (both classes averaged),
+    and per-class F1 (NST=0, ST=1). AUROC/ECE are threshold-free.
+    """
     has_both = len(np.unique(targets)) > 1
     out = {
         "auroc": roc_auc_score(targets, probs) if has_both else float("nan"),
         "ece": expected_calibration_error(probs, targets),
+        "bal_acc": balanced_accuracy_score(targets, preds),
+        "f1_macro": f1_score(targets, preds, average="macro", zero_division=0),
+        "f1_neg": f1_score(targets, preds, pos_label=0, zero_division=0),
+        "f1_pos": f1_score(targets, preds, pos_label=1, zero_division=0),
         "acc": accuracy_score(targets, preds),
-        "prec": precision_score(targets, preds, zero_division=0),
-        "rec": recall_score(targets, preds, zero_division=0),
-        "f1": f1_score(targets, preds, zero_division=0),
     }
     return out
 
@@ -448,18 +481,30 @@ def metrics(targets, preds, probs) -> Dict[str, float]:
 
 def standardize_hrv_per_fold(data: Dict, train_idx: np.ndarray) -> Dict:
     """
-    Returns a shallow copy of `data` with HRV (and baseline HRV) z-scored using
-    ONLY the training-fold statistics (no leakage). Current-window HRV and the
-    baseline share the SAME scaler so the rule engine compares like with like.
-    Spectrograms/labels/etc. are passed through by reference.
+    Returns a shallow copy of `data` with HRV (and baseline HRV) IMPUTED and z-scored
+    using ONLY the training-fold statistics (no leakage). Steps, all train-only:
+      1. Impute missing (NaN) HRV with TRAIN-fold medians (closes the pre-split leak).
+      2. Z-score with TRAIN-fold mean/std.
+    Current-window HRV and the baseline share the SAME imputation+scaler so the rule
+    engine compares like with like. Spectrograms/labels/etc. pass through by reference.
     """
     hrv = data["x_hrv"]
     base = data["x_baselines"]
-    mu = hrv[train_idx].mean(axis=0)
-    sd = hrv[train_idx].std(axis=0) + 1e-6
+
+    # 1. TRAIN-only median imputation (nanmedian ignores missing cells).
+    train_median = np.nanmedian(hrv[train_idx], axis=0)
+    train_median = np.where(np.isfinite(train_median), train_median, 0.0)  # all-NaN col -> 0
+    hrv_imp = np.where(np.isnan(hrv), train_median, hrv)
+    base_imp = np.where(np.isnan(base), train_median, base)
+    hrv_imp = np.nan_to_num(hrv_imp, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    base_imp = np.nan_to_num(base_imp, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    # 2. TRAIN-only standardization.
+    mu = hrv_imp[train_idx].mean(axis=0)
+    sd = hrv_imp[train_idx].std(axis=0) + 1e-6
     scaled = dict(data)
-    scaled["x_hrv"] = ((hrv - mu) / sd).astype(np.float32)
-    scaled["x_baselines"] = ((base - mu) / sd).astype(np.float32)
+    scaled["x_hrv"] = ((hrv_imp - mu) / sd).astype(np.float32)
+    scaled["x_baselines"] = ((base_imp - mu) / sd).astype(np.float32)
     return scaled
 
 
@@ -479,6 +524,8 @@ def run_comparison(data: Dict, n_splits: int, epochs: int) -> Dict[str, List[Dic
           f"handover={USE_HANDOVER}\n{'='*60}")
 
     results = {"nn": [], "nsa": []}
+    # SUPPLEMENTARY subject-level results (kept SEPARATE from window-level `results`).
+    subject_results = {"nn": [], "nsa": []}
     for fold, (train_idx, val_idx) in enumerate(splits, 1):
         train_subj = set(data["x_subjects"][train_idx])
         val_subj = set(data["x_subjects"][val_idx])
@@ -492,10 +539,17 @@ def run_comparison(data: Dict, n_splits: int, epochs: int) -> Dict[str, List[Dic
         train_loader = DataLoader(Subset(fold_dataset, train_idx), batch_size=BATCH_SIZE, shuffle=True)
         val_loader = DataLoader(Subset(fold_dataset, val_idx), batch_size=BATCH_SIZE, shuffle=False)
 
+        # Class-weighted loss (inverse frequency from the TRAIN fold) to counter the
+        # positive-class over-prediction bias. Weights come from train labels only.
+        train_labels = data["y_labels"][train_idx]
+        counts = np.bincount(train_labels, minlength=2).astype(np.float64)
+        class_weights = counts.sum() / (2.0 * np.clip(counts, 1.0, None))
+        weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
+
         for model_type in ("nn", "nsa"):
             torch.manual_seed(SEED + fold)  # same init seed per fold for both models
             model = build_model(model_type, data).to(device)
-            criterion = nn.CrossEntropyLoss()
+            criterion = nn.CrossEntropyLoss(weight=weight_tensor)
             optimizer = torch.optim.Adam(model.parameters(), lr=LR)
             scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[LR_DROP_EPOCH], gamma=0.1)
 
@@ -503,19 +557,30 @@ def run_comparison(data: Dict, n_splits: int, epochs: int) -> Dict[str, List[Dic
                 train_one_epoch(model, train_loader, criterion, optimizer, device, model_type)
                 scheduler.step()
 
-            preds, probs, targets = evaluate(model, val_loader, device, model_type)
+            preds, probs, targets, subj_ids = evaluate(
+                model, val_loader, device, model_type,
+                subject_ids=data["x_subjects"][val_idx])
+            # --- PRIMARY window-level metrics (UNCHANGED) ---
             m = metrics(targets, preds, probs)
             results[model_type].append(m)
-            print(f"  [{MODEL_LABEL[model_type]:>9}] acc={m['acc']*100:5.2f}%  f1={m['f1']*100:5.2f}%  "
-                  f"auroc={m['auroc']:.3f}")
+            print(f"  [{MODEL_LABEL[model_type]:>9}] bal_acc={m['bal_acc']*100:5.2f}%  "
+                  f"f1_macro={m['f1_macro']*100:5.2f}%  auroc={m['auroc']:.3f}  "
+                  f"(f1 NST/ST={m['f1_neg']*100:4.1f}/{m['f1_pos']*100:4.1f})")
 
-    return results
+            # --- SUPPLEMENTARY subject-level AUROC (separate; does not affect the above) ---
+            s_probs, s_labels = aggregate_by_subject(targets, probs, subj_ids)
+            s_auroc = (roc_auc_score(s_labels, s_probs)
+                       if len(np.unique(s_labels)) > 1 else float("nan"))
+            subject_results[model_type].append(s_auroc)
+
+    return results, subject_results
 
 
 def summarize(results: Dict[str, List[Dict]]):
-    # AUROC first (primary, threshold-free); ECE second (calibration, LOWER is better).
-    keys = ["auroc", "ece", "acc", "prec", "rec", "f1"]
-    fraction_keys = {"auroc", "ece"}  # reported on 0-1 scale, the rest as %
+    # AUROC first (primary, threshold-free); ECE second (calibration, LOWER is better);
+    # then balance-robust symmetric metrics. 'acc' (raw) kept last for reference only.
+    keys = ["auroc", "ece", "bal_acc", "f1_macro", "f1_neg", "f1_pos", "acc"]
+    fraction_keys = {"auroc", "ece", "bal_acc", "f1_macro", "f1_neg", "f1_pos"}
 
     print(f"\n{'='*72}\n SUBJECT-INDEPENDENT COMPARISON (mean +/- std over folds)")
     print(f" AUROC = primary (higher better) | ECE = calibration (LOWER better)\n{'='*72}")
@@ -533,7 +598,7 @@ def summarize(results: Dict[str, List[Dict]]):
 
     # --- Corrected paired significance test (Nadeau-Bengio) on the key metrics ---
     print(f"\n Paired test PAPER+NSA vs PAPER (Nadeau-Bengio corrected, {len(results['nn'])} folds):")
-    for key in ["auroc", "acc", "f1", "ece"]:
+    for key in ["auroc", "bal_acc", "f1_macro", "ece"]:
         diffs = [n[key] - p[key] for n, p in zip(results["nsa"], results["nn"])]
         t, pval = corrected_paired_ttest(diffs)
         sig = "significant" if np.isfinite(pval) and pval < 0.05 else "n.s."
@@ -543,6 +608,31 @@ def summarize(results: Dict[str, List[Dict]]):
         print(f"   {key:<6} mean Delta={np.nanmean(diffs):+.4f} {better:<14} "
               f"t={t:+.3f}  p={pval:.4f}  -> {sig}")
     print(f"{'='*72}\n")
+
+
+def summarize_subject_level(subject_results: Dict[str, List[float]]):
+    """
+    SUPPLEMENTARY report: subject-level AUROC (window probabilities aggregated per
+    subject), addressing within-subject correlation. Uses the SAME fold alignment and
+    the SAME Nadeau-Bengio corrected paired test. Reported separately from the primary
+    window-level analysis; none of the window-level numbers are affected.
+    """
+    nn_vals = np.array(subject_results["nn"], dtype=float)
+    nsa_vals = np.array(subject_results["nsa"], dtype=float)
+
+    print(f"\n{'='*60}\nSUPPLEMENTARY SUBJECT-LEVEL ANALYSIS")
+    print(f"(window probabilities aggregated per subject)\n{'='*60}")
+    print(f"{'metric':<16}{'PAPER':>12}{'PAPER+NSA':>12}{'Delta(NSA-Paper)':>18}")
+    nn_m, nsa_m = np.nanmean(nn_vals), np.nanmean(nsa_vals)
+    print(f"{'subject_AUROC':<16}{nn_m:>12.2f}{nsa_m:>12.2f}{(f'{nsa_m-nn_m:+.2f}'):>18}")
+
+    diffs = [n - p for n, p in zip(nsa_vals, nn_vals)]
+    t, pval = corrected_paired_ttest(diffs)
+    print(f"\nPaired test (Nadeau-Bengio corrected, {len(nn_vals)} folds):")
+    print(f"subject_AUROC mean Delta={np.nanmean(diffs):+.4f}")
+    print(f"t={t:+.3f}")
+    print(f"p={pval:.4f}  -> {'significant' if np.isfinite(pval) and pval < 0.05 else 'n.s.'}")
+    print(f"{'='*60}\n")
 
 
 # ==============================================================================
@@ -562,8 +652,11 @@ if __name__ == "__main__":
         subjects = subjects[:MAX_SUBJECTS]
     print(f"Using {len(subjects)} subjects: {subjects}")
 
-    # Cache keyed by subject count so changing MAX_SUBJECTS auto-uses a fresh cache.
-    cache_path = f"processed_real_dataset_{len(subjects)}subj.pkl"
+    # Cache keyed by subject count. The 'rawhrv' tag marks the new format that stores
+    # UN-imputed HRV (NaN kept) for leakage-free per-fold imputation; it will not reuse
+    # the old imputed cache, so the dataset is reprocessed once.
+    cache_path = f"processed_real_dataset_{len(subjects)}subj_rawhrv.pkl"
     data = load_and_cache_dataset(BASE_DATASET_DIR, subjects, cache_path)
-    results = run_comparison(data, n_splits=N_SPLITS, epochs=EPOCHS)
-    summarize(results)
+    results, subject_results = run_comparison(data, n_splits=N_SPLITS, epochs=EPOCHS)
+    summarize(results)                          # PRIMARY window-level analysis (unchanged)
+    summarize_subject_level(subject_results)    # SUPPLEMENTARY subject-level analysis
