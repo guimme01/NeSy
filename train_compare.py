@@ -54,6 +54,7 @@ from ecg_preprocessing import (
 )
 from se_ecg_net import SEECGNet
 from nsa_ecg_net import NSAECGNet
+from ltn_axioms import build_axiom_indices, ltn_physio_loss
 
 # ==============================================================================
 # CONFIG  (edit these; you run the training)
@@ -70,10 +71,14 @@ SEED = 42
 
 # --- Neuro-Symbolic layer toggles (for the PAPER+NSA arm) ---
 USE_HRV_BRANCH = True     # hybrid HRV features (the useful part; HRV is the strong signal)
-USE_RULE_ENGINE = True    # physiological baseline-shift rule (on STANDARDIZED HRV)
+USE_RULE_ENGINE = False   # physiological baseline-shift rule (on STANDARDIZED HRV)
 USE_HANDOVER = False      # causal handover bias: label-INDEPENDENT -> hurts accuracy by design.
                           # It is a safety-conservatism feature, not an accuracy feature.
                           # Keep OFF for the head-to-head; flip ON only to study safety behaviour.
+
+# --- Logic Tensor Network (true neuro-symbolic) constraints, applied to the NSA arm only ---
+USE_LTN = True            # add LTN physiological axioms to the NSA training loss
+LTN_WEIGHT = 0.5          # lambda: loss = CrossEntropy + LTN_WEIGHT * (1 - satisfaction)
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -361,13 +366,19 @@ def forward_logits(model, batch, model_type, device):
     return logits, labels
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, model_type):
+def train_one_epoch(model, loader, criterion, optimizer, device, model_type, ltn_ctx=None):
     model.train()
     running, correct, total = 0.0, 0, 0
     for batch in loader:
         optimizer.zero_grad()
         logits, labels = forward_logits(model, batch, model_type, device)
         loss = criterion(logits, labels)
+        # Neuro-symbolic term: physiological LTN axioms, NSA arm only (PAPER untouched).
+        if ltn_ctx is not None and model_type == "nsa":
+            hrv = batch[1].to(device)
+            baseline = batch[2].to(device)
+            p_high = torch.softmax(logits, dim=1)[:, 1]
+            loss = loss + ltn_ctx["weight"] * ltn_physio_loss(p_high, hrv, baseline, ltn_ctx["idxs"])
         loss.backward()
         optimizer.step()
         running += loss.item() * labels.size(0)
@@ -518,10 +529,15 @@ def run_comparison(data: Dict, n_splits: int, epochs: int) -> Dict[str, List[Dic
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
     splits = list(sgkf.split(data["x_spectrograms"], data["y_labels"], groups=data["x_subjects"]))
 
+    # LTN context (physiological axiom indices + weight), applied to the NSA arm only.
+    ltn_ctx = None
+    if USE_LTN:
+        ltn_ctx = {"idxs": build_axiom_indices(data["hrv_feature_names"]), "weight": LTN_WEIGHT}
+
     print(f"\n{'='*60}\n Subject-independent {n_splits}-fold StratifiedGroupKFold")
     print(f" Subjects: {n_subjects} | Windows: {len(data['y_labels'])} | Device: {device}")
     print(f" NSA layer: hrv_branch={USE_HRV_BRANCH} rule={USE_RULE_ENGINE} "
-          f"handover={USE_HANDOVER}\n{'='*60}")
+          f"handover={USE_HANDOVER} | LTN={USE_LTN} (lambda={LTN_WEIGHT})\n{'='*60}")
 
     results = {"nn": [], "nsa": []}
     # SUPPLEMENTARY subject-level results (kept SEPARATE from window-level `results`).
@@ -554,7 +570,7 @@ def run_comparison(data: Dict, n_splits: int, epochs: int) -> Dict[str, List[Dic
             scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[LR_DROP_EPOCH], gamma=0.1)
 
             for _ in range(epochs):
-                train_one_epoch(model, train_loader, criterion, optimizer, device, model_type)
+                train_one_epoch(model, train_loader, criterion, optimizer, device, model_type, ltn_ctx)
                 scheduler.step()
 
             preds, probs, targets, subj_ids = evaluate(
