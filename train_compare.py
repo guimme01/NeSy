@@ -80,8 +80,16 @@ USE_HANDOVER = False      # causal handover bias: label-INDEPENDENT -> hurts acc
 USE_LTN = True            # add LTN physiological axioms to the NSA training loss
 LTN_WEIGHT = 0.5          # lambda: loss = CrossEntropy + LTN_WEIGHT * (1 - satisfaction)
 
+# --- Plot logging ---
+PLOT_DIR = "plot_data"    # per-fold probabilities and per-epoch loss curves are dumped here
+
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+# Full determinism: without these, cuDNN convolutions are non-deterministic and two runs
+# differ by ~0.005-0.02 AUROC, which would desynchronize the tables from the figures.
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 
 # ==============================================================================
@@ -367,24 +375,36 @@ def forward_logits(model, batch, model_type, device):
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device, model_type, ltn_ctx=None):
+    """
+    Returns (mean_total_loss, accuracy, mean_CE, mean_satisfaction).
+    mean_satisfaction is SatAgg(K) in [0,1] (NaN when the LTN term is not applied),
+    logged so the CE and the logical-satisfaction curves can be plotted side by side.
+    """
     model.train()
     running, correct, total = 0.0, 0, 0
+    running_ce, running_sat, n_sat = 0.0, 0.0, 0
     for batch in loader:
         optimizer.zero_grad()
         logits, labels = forward_logits(model, batch, model_type, device)
-        loss = criterion(logits, labels)
+        ce = criterion(logits, labels)
+        loss = ce
         # Neuro-symbolic term: physiological LTN axioms, NSA arm only (PAPER untouched).
         if ltn_ctx is not None and model_type == "nsa":
             hrv = batch[1].to(device)
             baseline = batch[2].to(device)
             p_high = torch.softmax(logits, dim=1)[:, 1]
-            loss = loss + ltn_ctx["weight"] * ltn_physio_loss(p_high, hrv, baseline, ltn_ctx["idxs"])
+            ltn_term = ltn_physio_loss(p_high, hrv, baseline, ltn_ctx["idxs"])
+            loss = loss + ltn_ctx["weight"] * ltn_term
+            running_sat += float(1.0 - ltn_term.detach()) * labels.size(0)  # satisfaction
+            n_sat += labels.size(0)
         loss.backward()
         optimizer.step()
         running += loss.item() * labels.size(0)
+        running_ce += float(ce.detach()) * labels.size(0)
         correct += (logits.argmax(1) == labels).sum().item()
         total += labels.size(0)
-    return running / total, correct / total
+    mean_sat = (running_sat / n_sat) if n_sat > 0 else float("nan")
+    return running / total, correct / total, running_ce / total, mean_sat
 
 
 @torch.no_grad()
@@ -542,6 +562,8 @@ def run_comparison(data: Dict, n_splits: int, epochs: int) -> Dict[str, List[Dic
     results = {"nn": [], "nsa": []}
     # SUPPLEMENTARY subject-level results (kept SEPARATE from window-level `results`).
     subject_results = {"nn": [], "nsa": []}
+    # Raw per-fold data for the figures (probabilities, labels, loss curves).
+    plot_log = {"nn": [], "nsa": []}
     for fold, (train_idx, val_idx) in enumerate(splits, 1):
         train_subj = set(data["x_subjects"][train_idx])
         val_subj = set(data["x_subjects"][val_idx])
@@ -569,8 +591,12 @@ def run_comparison(data: Dict, n_splits: int, epochs: int) -> Dict[str, List[Dic
             optimizer = torch.optim.Adam(model.parameters(), lr=LR)
             scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[LR_DROP_EPOCH], gamma=0.1)
 
+            curve_ce, curve_sat = [], []
             for _ in range(epochs):
-                train_one_epoch(model, train_loader, criterion, optimizer, device, model_type, ltn_ctx)
+                _, _, ep_ce, ep_sat = train_one_epoch(
+                    model, train_loader, criterion, optimizer, device, model_type, ltn_ctx)
+                curve_ce.append(ep_ce)
+                curve_sat.append(ep_sat)
                 scheduler.step()
 
             preds, probs, targets, subj_ids = evaluate(
@@ -588,6 +614,21 @@ def run_comparison(data: Dict, n_splits: int, epochs: int) -> Dict[str, List[Dic
             s_auroc = (roc_auc_score(s_labels, s_probs)
                        if len(np.unique(s_labels)) > 1 else float("nan"))
             subject_results[model_type].append(s_auroc)
+
+            # --- Dump everything the figures need (does not affect any reported metric) ---
+            plot_log[model_type].append({
+                "fold": fold,
+                "probs": probs, "targets": targets, "subjects": subj_ids,
+                "subject_probs": s_probs, "subject_labels": s_labels,
+                "curve_ce": np.array(curve_ce, dtype=float),
+                "curve_sat": np.array(curve_sat, dtype=float),
+                "auroc": m["auroc"], "subject_auroc": s_auroc,
+            })
+
+    os.makedirs(PLOT_DIR, exist_ok=True)
+    with open(os.path.join(PLOT_DIR, "plot_data.pkl"), "wb") as f:
+        pickle.dump(plot_log, f)
+    print(f"\nFigure data written to '{os.path.join(PLOT_DIR, 'plot_data.pkl')}'.")
 
     return results, subject_results
 
