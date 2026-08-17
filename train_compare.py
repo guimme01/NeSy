@@ -54,12 +54,21 @@ from ecg_preprocessing import (
 )
 from se_ecg_net import SEECGNet
 from nsa_ecg_net import NSAECGNet
+from cnn_bilstm_net import CNNBiLSTMNet
+from nsa_cnn_bilstm_net import NSACNNBiLSTMNet
 from ltn_axioms import build_axiom_indices, ltn_physio_loss
 
 # ==============================================================================
 # CONFIG  (edit these; you run the training)
 # ==============================================================================
 BASE_DATASET_DIR = "Exp2/Exp2"
+# Which backbone to run the Backbone-vs-Backbone+NSA ablation on. The neuro-symbolic
+# layer (HRV branch + LTN axioms) is IDENTICAL for both; only the neural backbone changes,
+# which is exactly the point: it shows the symbolic gain is not architecture-specific.
+#   "seecg"    -> SE-ECG Net (2D spectrogram CNN, the paper model).
+#   "cnnlstm"  -> CNN-BiLSTM (raw 1D ECG waveform).
+# Run the script once per backbone (results/figures land in a backbone-specific folder).
+BACKBONE = "cnnlstm"                              # "seecg" | "cnnlstm"
 SUBJECTS: Optional[List[str]] = None            # None = auto-discover ALL subjects
 MAX_SUBJECTS: Optional[int] = None              # None = use ALL subjects (slow preprocessing)
 N_SPLITS = 10                                   # StratifiedGroupKFold folds (paper uses 10)
@@ -81,7 +90,8 @@ USE_LTN = True            # add LTN physiological axioms to the NSA training los
 LTN_WEIGHT = 0.5          # lambda: loss = CrossEntropy + LTN_WEIGHT * (1 - satisfaction)
 
 # --- Plot logging ---
-PLOT_DIR = "plot_data"    # per-fold probabilities and per-epoch loss curves are dumped here
+# Backbone-specific so the two ablations (seecg / cnnlstm) do not overwrite each other.
+PLOT_DIR = f"plot_data_{BACKBONE}"    # per-fold probabilities and per-epoch loss curves
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -231,6 +241,7 @@ def preprocess_real_subject_data(
 
     return {
         "spectrograms": spectrograms,
+        "windows": np.asarray(windows, dtype=np.float32),  # RAW 1D ECG (N, 21600) for CNN-BiLSTM
         "hrv_df": pd.DataFrame(subject_hrv_list),
         "baseline_hrv": baseline_hrv_features,
         "handover": np.array(handover_contexts, dtype=np.float32),
@@ -248,7 +259,7 @@ def load_and_cache_dataset(base_dir: str, subjects: List[str], cache_path: str) 
             return pickle.load(f)
 
     print("\n--- Processing physiological data ---")
-    all_specs, all_hrv_dfs = [], []
+    all_specs, all_windows, all_hrv_dfs = [], [], []
     all_baseline_series, all_nwins = [], []
     all_handovers, all_labels, all_subjects = [], [], []
 
@@ -262,6 +273,7 @@ def load_and_cache_dataset(base_dir: str, subjects: List[str], cache_path: str) 
             continue
         n_wins = len(res["spectrograms"])
         all_specs.append(res["spectrograms"])
+        all_windows.append(res["windows"])
         all_hrv_dfs.append(res["hrv_df"])
         # Keep the baseline as a Series; align its columns AFTER the window feature
         # set is known (baseline is a 5-min signal -> more HRV cols than 60s windows).
@@ -275,6 +287,7 @@ def load_and_cache_dataset(base_dir: str, subjects: List[str], cache_path: str) 
         raise ValueError("No subjects processed. Check paths and markers.")
 
     x_spectrograms = np.concatenate(all_specs, axis=0)
+    x_windows = np.concatenate(all_windows, axis=0).astype(np.float32)  # RAW 1D ECG for CNN-BiLSTM
     x_handovers = np.concatenate(all_handovers, axis=0)
     y_labels = np.concatenate(all_labels, axis=0)
     x_subjects = np.array(all_subjects)
@@ -298,6 +311,7 @@ def load_and_cache_dataset(base_dir: str, subjects: List[str], cache_path: str) 
 
     dataset_dict = {
         "x_spectrograms": x_spectrograms,
+        "x_windows": x_windows,
         "x_hrv": x_hrv,
         "x_baselines": x_baselines,
         "x_handovers": x_handovers,
@@ -318,6 +332,9 @@ def load_and_cache_dataset(base_dir: str, subjects: List[str], cache_path: str) 
 class RealECGDataset(Dataset):
     def __init__(self, data: Dict):
         self.spectrograms = torch.tensor(data["x_spectrograms"], dtype=torch.float32)
+        # RAW 1D ECG window (kept as numpy to avoid a ~1GB always-resident tensor; the
+        # raw is sliced to a tensor per item only when the CNN-BiLSTM backbone reads it).
+        self.windows = np.asarray(data["x_windows"], dtype=np.float32)
         self.hrv = torch.tensor(data["x_hrv"], dtype=torch.float32)
         self.baselines = torch.tensor(data["x_baselines"], dtype=torch.float32)
         self.handovers = torch.tensor(data["x_handovers"], dtype=torch.float32)
@@ -327,31 +344,41 @@ class RealECGDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        return (self.spectrograms[idx], self.hrv[idx], self.baselines[idx],
-                self.handovers[idx], self.labels[idx])
+        return (self.spectrograms[idx], torch.from_numpy(self.windows[idx]),
+                self.hrv[idx], self.baselines[idx], self.handovers[idx], self.labels[idx])
 
 
 # ==============================================================================
 # 4. MODEL-AGNOSTIC FORWARD / TRAIN / EVAL
 # ==============================================================================
 
-MODEL_LABEL = {"nn": "PAPER", "nsa": "PAPER+NSA"}
+# Labels adapt to the active backbone so logs read correctly for both ablations.
+_BACKBONE_NAME = {"seecg": "SE-ECG", "cnnlstm": "CNN-LSTM"}
+MODEL_LABEL = {"nn": _BACKBONE_NAME.get(BACKBONE, BACKBONE),
+               "nsa": _BACKBONE_NAME.get(BACKBONE, BACKBONE) + "+NSA"}
 
 
 def build_model(model_type: str, data: Dict) -> nn.Module:
     """
-    'nn'  -> the exact paper model (SE-ECG Net).
-    'nsa' -> the SAME paper model, wrapped with the additive Neuro-Symbolic layer.
+    'nn'  -> the plain neural backbone selected by BACKBONE.
+    'nsa' -> the SAME backbone, wrapped with the additive Neuro-Symbolic layer.
 
-    The SEECGNet backbone is constructed FIRST in both branches, so with the same
-    per-fold seed the paper backbone gets identical initial weights in both models;
-    only the extra NSA parameters differ.
+    The backbone is constructed FIRST in both branches, so with the same per-fold seed
+    it gets identical initial weights in both models; only the extra NSA parameters differ.
     """
-    base = SEECGNet(in_channels=1, num_classes=2, conv_channels=(32, 64, 128))
+    if BACKBONE == "seecg":
+        base = SEECGNet(in_channels=1, num_classes=2, conv_channels=(32, 64, 128))
+        nsa_cls = NSAECGNet
+    elif BACKBONE == "cnnlstm":
+        base = CNNBiLSTMNet(in_channels=1, num_classes=2, conv_channels=(32, 64, 128))
+        nsa_cls = NSACNNBiLSTMNet
+    else:
+        raise ValueError(f"Unknown BACKBONE '{BACKBONE}'")
+
     if model_type == "nn":
         return base
     elif model_type == "nsa":
-        return NSAECGNet(
+        return nsa_cls(
             base_model=base,
             num_hrv_features=data["x_hrv"].shape[1],
             hrv_feature_names=data["hrv_feature_names"],
@@ -364,12 +391,14 @@ def build_model(model_type: str, data: Dict) -> nn.Module:
 
 
 def forward_logits(model, batch, model_type, device):
-    """Unified forward returning logits for either model."""
-    specs, hrv, baselines, handovers, labels = [t.to(device) for t in batch]
+    """Unified forward returning logits for either model and either backbone."""
+    specs, windows, hrv, baselines, handovers, labels = [t.to(device) for t in batch]
+    # The backbone reads the spectrogram (seecg) or the raw 1D ECG window (cnnlstm).
+    x_backbone = specs if BACKBONE == "seecg" else windows.unsqueeze(1)  # (B,1,T) for Conv1d
     if model_type == "nn":
-        logits = model(specs, return_logits=True)          # spectrogram only
+        logits = model(x_backbone, return_logits=True)
     else:
-        logits = model(x_spectrogram=specs, x_hrv=hrv, baseline_hrv=baselines,
+        logits = model(x_backbone, x_hrv=hrv, baseline_hrv=baselines,
                        handover_imminent=handovers, return_logits=True)
     return logits, labels
 
@@ -390,8 +419,9 @@ def train_one_epoch(model, loader, criterion, optimizer, device, model_type, ltn
         loss = ce
         # Neuro-symbolic term: physiological LTN axioms, NSA arm only (PAPER untouched).
         if ltn_ctx is not None and model_type == "nsa":
-            hrv = batch[1].to(device)
-            baseline = batch[2].to(device)
+            # batch = (specs, windows, hrv, baselines, handovers, labels)
+            hrv = batch[2].to(device)
+            baseline = batch[3].to(device)
             p_high = torch.softmax(logits, dim=1)[:, 1]
             ltn_term = ltn_physio_loss(p_high, hrv, baseline, ltn_ctx["idxs"])
             loss = loss + ltn_ctx["weight"] * ltn_term
@@ -639,9 +669,10 @@ def summarize(results: Dict[str, List[Dict]]):
     keys = ["auroc", "ece", "bal_acc", "f1_macro", "f1_neg", "f1_pos", "acc"]
     fraction_keys = {"auroc", "ece", "bal_acc", "f1_macro", "f1_neg", "f1_pos"}
 
-    print(f"\n{'='*72}\n SUBJECT-INDEPENDENT COMPARISON (mean +/- std over folds)")
+    lbl_nn, lbl_nsa = MODEL_LABEL["nn"], MODEL_LABEL["nsa"]
+    print(f"\n{'='*72}\n SUBJECT-INDEPENDENT COMPARISON (mean +/- std over folds) | backbone: {BACKBONE}")
     print(f" AUROC = primary (higher better) | ECE = calibration (LOWER better)\n{'='*72}")
-    print(f"{'metric':<8}{'PAPER':>16}{'PAPER+NSA':>16}{'Delta(NSA-Paper)':>18}")
+    print(f"{'metric':<8}{lbl_nn:>16}{lbl_nsa:>16}{'Delta(NSA-base)':>18}")
 
     for key in keys:
         nn_vals = np.array([r[key] for r in results["nn"]])
@@ -654,7 +685,7 @@ def summarize(results: Dict[str, List[Dict]]):
         print(f"{key:<8}{nn_s:>16}{nsa_s:>16}{(f'{delta:+.2f}'+unit):>18}")
 
     # --- Corrected paired significance test (Nadeau-Bengio) on the key metrics ---
-    print(f"\n Paired test PAPER+NSA vs PAPER (Nadeau-Bengio corrected, {len(results['nn'])} folds):")
+    print(f"\n Paired test {lbl_nsa} vs {lbl_nn} (Nadeau-Bengio corrected, {len(results['nn'])} folds):")
     for key in ["auroc", "bal_acc", "f1_macro", "ece"]:
         diffs = [n[key] - p[key] for n, p in zip(results["nsa"], results["nn"])]
         t, pval = corrected_paired_ttest(diffs)
@@ -709,10 +740,10 @@ if __name__ == "__main__":
         subjects = subjects[:MAX_SUBJECTS]
     print(f"Using {len(subjects)} subjects: {subjects}")
 
-    # Cache keyed by subject count. The 'rawhrv' tag marks the new format that stores
-    # UN-imputed HRV (NaN kept) for leakage-free per-fold imputation; it will not reuse
-    # the old imputed cache, so the dataset is reprocessed once.
-    cache_path = f"processed_real_dataset_{len(subjects)}subj_rawhrv.pkl"
+    # Cache keyed by subject count. 'rawhrv' = UN-imputed HRV (NaN kept) for leakage-free
+    # per-fold imputation; 'raw1d' = also stores the raw 1D ECG window for the CNN-BiLSTM
+    # backbone. This new tag will not reuse the old cache, so the dataset is reprocessed once.
+    cache_path = f"processed_real_dataset_{len(subjects)}subj_rawhrv_raw1d.pkl"
     data = load_and_cache_dataset(BASE_DATASET_DIR, subjects, cache_path)
     results, subject_results = run_comparison(data, n_splits=N_SPLITS, epochs=EPOCHS)
     summarize(results)                          # PRIMARY window-level analysis (unchanged)
