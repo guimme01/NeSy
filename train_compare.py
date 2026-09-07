@@ -27,6 +27,7 @@ The user runs training/inference; this script only defines and prepares the pipe
 
 import os
 import re
+import sys
 import glob
 import pickle
 import numpy as np
@@ -56,7 +57,7 @@ from se_ecg_net import SEECGNet
 from nsa_ecg_net import NSAECGNet
 from cnn_bilstm_net import CNNBiLSTMNet
 from nsa_cnn_bilstm_net import NSACNNBiLSTMNet
-from ltn_axioms import build_axiom_indices, ltn_physio_loss
+from ltn_axioms import build_axiom_indices, ltn_physio_loss, axiom_weights
 
 # ==============================================================================
 # CONFIG  (edit these; you run the training)
@@ -87,11 +88,82 @@ USE_HANDOVER = False      # causal handover bias: label-INDEPENDENT -> hurts acc
 
 # --- Logic Tensor Network (true neuro-symbolic) constraints, applied to the NSA arm only ---
 USE_LTN = True            # add LTN physiological axioms to the NSA training loss
-LTN_WEIGHT = 0.5          # lambda: loss = CrossEntropy + LTN_WEIGHT * (1 - satisfaction)
+# lambda / k / KB composition, overridable via env for the LTN-improvement sweep:
+#   NSA_LTN_WEIGHT: lambda (default 0.5, the paper value)
+#   NSA_LTN_K     : predicate sharpness (default 2.0, the paper value)
+#   NSA_KB        : 'old' = paper KB (3 forward axioms, unweighted)
+#                   'w'   = forward axioms + train-validated weights (silences RMSSD)
+#                   'bi'  = forward + converse axiom, unweighted
+#                   'biw' = forward + converse + weights (default)
+LTN_WEIGHT = float(os.environ.get("NSA_LTN_WEIGHT", "0.5"))
+LTN_K = float(os.environ.get("NSA_LTN_K", "2.0"))
+KB_MODE = os.environ.get("NSA_KB", "biw")
+assert KB_MODE in ("old", "w", "bi", "biw"), f"bad NSA_KB '{KB_MODE}'"
+
+# --- LTN REST axiom (NSA_REST=1): forall x in Rest: NOT HighLoad(x). ---
+# Grounded on UNLABELED windows from each training subject's Training-1 resting
+# period: protocol knowledge ("at rest, load is low") that gives ST subjects the
+# low-load examples the between-subjects CE labels cannot provide. Architecture,
+# CE, folds and evaluation are untouched; only the NSA arm's LTN loss sees them.
+REST_AXIOM = os.environ.get("NSA_REST", "0") == "1"
+REST_WEIGHT = float(os.environ.get("NSA_REST_WEIGHT", str(LTN_WEIGHT)))
+
+# --- Optional CLI overrides (factorial ablation without editing the file) ---
+#   python train_compare.py                    -> config above, unchanged
+#   python train_compare.py <backbone>         -> seecg | cnnlstm
+#   python train_compare.py <backbone> <arm>   -> arm: hrv (HRV branch only)
+#                                                      ltn (LTN axioms only)
+#                                                      both (full PGNSF)
+if len(sys.argv) > 1:
+    if sys.argv[1] not in ("seecg", "cnnlstm"):
+        raise SystemExit(f"usage: python train_compare.py [seecg|cnnlstm] [hrv|ltn|both]")
+    BACKBONE = sys.argv[1]
+if len(sys.argv) > 2:
+    if sys.argv[2] not in ("hrv", "ltn", "both"):
+        raise SystemExit(f"usage: python train_compare.py [seecg|cnnlstm] [hrv|ltn|both]")
+    USE_HRV_BRANCH = sys.argv[2] in ("hrv", "both")
+    USE_LTN = sys.argv[2] in ("ltn", "both")
+
+# --- Dev mode: NSA_DEV_FOLDS selects a subset of folds (identical splits and
+# per-fold seeds as a full run, so fold i reproduces exactly). Accepts a count
+# ("3" = first three), a range ("4-6") or a comma list ("2,5,9"). For KB iteration.
+def _parse_dev_folds(spec):
+    if not spec:
+        return None
+    if "-" in spec:
+        a, b = spec.split("-")
+        return list(range(int(a), int(b) + 1))
+    if "," in spec:
+        return [int(x) for x in spec.split(",")]
+    n = int(spec)
+    return list(range(1, n + 1)) if n > 0 else None
+
+DEV_FOLDS = _parse_dev_folds(os.environ.get("NSA_DEV_FOLDS", ""))
+
+# --- Label-scarcity mode: NSA_LABEL_FRACTION=f (0<f<1) keeps the CE labels of only a
+# stratified fraction f of TRAINING subjects (seeded per fold); every other training
+# window becomes unlabeled (-1, ignored by the cross-entropy). The LTN axioms need no
+# labels and still apply to ALL training windows, so the comparison probes whether the
+# symbolic physiological knowledge compensates for scarce supervision. Validation
+# labels are never touched.
+LABEL_FRACTION = float(os.environ.get("NSA_LABEL_FRACTION", "1.0"))
 
 # --- Plot logging ---
-# Backbone-specific so the two ablations (seecg / cnnlstm) do not overwrite each other.
+# Backbone-specific so the two backbones do not overwrite each other; ablation arms
+# (HRV-only / LTN-only) get their own tagged folder so the paper's full-PGNSF
+# plot_data is never clobbered by an ablation run. Dev runs get their own suffix too.
 PLOT_DIR = f"plot_data_{BACKBONE}"    # per-fold probabilities and per-epoch loss curves
+if not (USE_HRV_BRANCH and USE_LTN):
+    PLOT_DIR += f"_hrv{int(USE_HRV_BRANCH)}_ltn{int(USE_LTN)}"
+if DEV_FOLDS:
+    PLOT_DIR += "_dev" + "-".join(str(i) for i in DEV_FOLDS)
+if LABEL_FRACTION < 1.0:
+    PLOT_DIR += f"_lab{int(round(LABEL_FRACTION * 100))}"
+if REST_AXIOM:
+    PLOT_DIR += "_rest"
+# Optional experiment tag (env NSA_TAG), e.g. "_kb2" for the revised weighted KB,
+# so new-KB runs never overwrite the submitted paper's plot_data folders.
+PLOT_DIR += os.environ.get("NSA_TAG", "")
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -207,6 +279,25 @@ def preprocess_real_subject_data(
     else:
         baseline_hrv_features = extract_hrv_features(base_clean, fs=target_sr, impute_strategy="mean")
 
+    # --- Rest windows from the Training-1 baseline period (LTN rest axiom) ---
+    # Protocol knowledge: during Training-1 the driver is AT REST, so cognitive load is
+    # low for EVERY subject, ST included. These windows carry no ST/NST label and are
+    # consumed ONLY by the label-free LTN term (forall x in Rest: NOT HighLoad(x)),
+    # giving high-load subjects the low-load examples the between-subjects CE lacks.
+    rest_windows = np.empty((0, int(60.0 * target_sr)), dtype=np.float32)
+    if len(base_peaks) >= 3:
+        rest_windows, _ = segment_and_window(
+            base_clean, base_peaks, sampling_rate=target_sr,
+            window_duration_sec=60.0, r_peak_step=10)
+    if len(rest_windows) > 0:
+        rest_spectrograms = ecg_to_spectrogram(rest_windows, fs=target_sr,
+                                               frame_duration_ms=350.0, norm_type="minmax")
+        rest_hrv_df = pd.DataFrame(
+            [extract_hrv_features(w, fs=target_sr, impute_strategy="none")
+             for w in rest_windows])
+    else:
+        rest_spectrograms, rest_hrv_df = None, None
+
     # --- Driving period (the classification target windows) ---
     drv_down = downsample_ecg(driving_ecg, orig_sr=orig_sr, target_sr=target_sr)
     drv_clean = denoise_ecg(drv_down, sampling_rate=target_sr, highpass_cutoff=0.5)
@@ -247,6 +338,10 @@ def preprocess_real_subject_data(
         "handover": np.array(handover_contexts, dtype=np.float32),
         "labels": np.full(len(windows), label, dtype=np.int64),
         "subject_ids": [subject_id] * len(windows),
+        # Rest windows (Training-1): unlabeled, LTN-only. None if the baseline is unusable.
+        "rest_windows": np.asarray(rest_windows, dtype=np.float32),
+        "rest_spectrograms": rest_spectrograms,
+        "rest_hrv_df": rest_hrv_df,
     }
 
 
@@ -262,6 +357,7 @@ def load_and_cache_dataset(base_dir: str, subjects: List[str], cache_path: str) 
     all_specs, all_windows, all_hrv_dfs = [], [], []
     all_baseline_series, all_nwins = [], []
     all_handovers, all_labels, all_subjects = [], [], []
+    r_specs, r_raw, r_hrv_dfs, r_base_series, r_counts, r_subjects = [], [], [], [], [], []
 
     for sub in subjects:
         try:
@@ -275,6 +371,14 @@ def load_and_cache_dataset(base_dir: str, subjects: List[str], cache_path: str) 
         all_specs.append(res["spectrograms"])
         all_windows.append(res["windows"])
         all_hrv_dfs.append(res["hrv_df"])
+        # Rest windows (unlabeled, LTN-only); subjects with unusable baselines are skipped.
+        if res.get("rest_spectrograms") is not None and len(res["rest_windows"]) > 0:
+            r_specs.append(res["rest_spectrograms"])
+            r_raw.append(res["rest_windows"])
+            r_hrv_dfs.append(res["rest_hrv_df"])
+            r_base_series.append(res["baseline_hrv"])
+            r_counts.append(len(res["rest_windows"]))
+            r_subjects.extend([sub] * len(res["rest_windows"]))
         # Keep the baseline as a Series; align its columns AFTER the window feature
         # set is known (baseline is a 5-min signal -> more HRV cols than 60s windows).
         all_baseline_series.append(res["baseline_hrv"])
@@ -309,9 +413,31 @@ def load_and_cache_dataset(base_dir: str, subjects: List[str], cache_path: str) 
     df_base = df_base.replace([np.inf, -np.inf], np.nan)
     x_baselines = df_base.values.astype(np.float32)  # RAW (contains NaN)
 
+    # --- Rest windows: align HRV columns and tile the subject baseline (RAW, NaN kept) ---
+    if r_specs:
+        x_rest_spectrograms = np.concatenate(r_specs, axis=0)
+        x_rest_windows = np.concatenate(r_raw, axis=0).astype(np.float32)
+        rest_hrv = pd.concat(r_hrv_dfs, axis=0, ignore_index=True)
+        rest_hrv = rest_hrv.reindex(columns=hrv_feature_names)
+        x_rest_hrv = rest_hrv.replace([np.inf, -np.inf], np.nan).values.astype(np.float32)
+        x_rest_baselines = np.concatenate(
+            [np.tile(s.reindex(hrv_feature_names).to_numpy(dtype=np.float32), (n, 1))
+             for s, n in zip(r_base_series, r_counts)], axis=0)
+        x_rest_subjects = np.array(r_subjects)
+        print(f"Rest windows extracted: {len(x_rest_subjects)} "
+              f"from {len(r_counts)} subjects (Training-1 baselines).")
+    else:
+        x_rest_spectrograms = x_rest_windows = x_rest_hrv = x_rest_baselines = None
+        x_rest_subjects = np.array([])
+
     dataset_dict = {
         "x_spectrograms": x_spectrograms,
         "x_windows": x_windows,
+        "x_rest_spectrograms": x_rest_spectrograms,
+        "x_rest_windows": x_rest_windows,
+        "x_rest_hrv": x_rest_hrv,
+        "x_rest_baselines": x_rest_baselines,
+        "x_rest_subjects": x_rest_subjects,
         "x_hrv": x_hrv,
         "x_baselines": x_baselines,
         "x_handovers": x_handovers,
@@ -352,10 +478,14 @@ class RealECGDataset(Dataset):
 # 4. MODEL-AGNOSTIC FORWARD / TRAIN / EVAL
 # ==============================================================================
 
-# Labels adapt to the active backbone so logs read correctly for both ablations.
+# Labels adapt to the active backbone AND ablation arm so logs read correctly.
 _BACKBONE_NAME = {"seecg": "SE-ECG", "cnnlstm": "CNN-LSTM"}
+_ARM = ("+NSA" if (USE_HRV_BRANCH and USE_LTN)
+        else "+HRV" if USE_HRV_BRANCH
+        else "+LTN" if USE_LTN
+        else "+none")
 MODEL_LABEL = {"nn": _BACKBONE_NAME.get(BACKBONE, BACKBONE),
-               "nsa": _BACKBONE_NAME.get(BACKBONE, BACKBONE) + "+NSA"}
+               "nsa": _BACKBONE_NAME.get(BACKBONE, BACKBONE) + _ARM}
 
 
 def build_model(model_type: str, data: Dict) -> nn.Module:
@@ -415,7 +545,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device, model_type, ltn
     for batch in loader:
         optimizer.zero_grad()
         logits, labels = forward_logits(model, batch, model_type, device)
-        ce = criterion(logits, labels)
+        if (labels >= 0).any():
+            ce = criterion(logits, labels)
+        else:
+            # Batch with no labeled samples (label-scarcity mode): no CE, LTN only.
+            ce = logits.sum() * 0.0
         loss = ce
         # Neuro-symbolic term: physiological LTN axioms, NSA arm only (PAPER untouched).
         if ltn_ctx is not None and model_type == "nsa":
@@ -423,8 +557,25 @@ def train_one_epoch(model, loader, criterion, optimizer, device, model_type, ltn
             hrv = batch[2].to(device)
             baseline = batch[3].to(device)
             p_high = torch.softmax(logits, dim=1)[:, 1]
-            ltn_term = ltn_physio_loss(p_high, hrv, baseline, ltn_ctx["idxs"])
+            ltn_term = ltn_physio_loss(p_high, hrv, baseline, ltn_ctx["idxs"],
+                                       k=ltn_ctx.get("k", 2.0),
+                                       bidirectional=ltn_ctx.get("bidirectional", True),
+                                       weights=ltn_ctx.get("weights"))
             loss = loss + ltn_ctx["weight"] * ltn_term
+
+            # REST axiom: forall x in Rest: NOT HighLoad(x), on a random minibatch of
+            # UNLABELED Training-1 rest windows (train subjects only). Forall via
+            # pMeanError (p=2) on the violation p_high, matching the KB's aggregator.
+            rest = ltn_ctx.get("rest")
+            if rest is not None and rest["x"].shape[0] > 0:
+                ridx = torch.randint(0, rest["x"].shape[0], (labels.size(0),))
+                r_logits = model(rest["x"][ridx].to(device),
+                                 x_hrv=rest["hrv"][ridx].to(device),
+                                 baseline_hrv=rest["base"][ridx].to(device),
+                                 return_logits=True)
+                p_rest = torch.softmax(r_logits, dim=1)[:, 1]
+                sat_rest = 1.0 - torch.sqrt(torch.mean(p_rest ** 2) + 1e-12)
+                loss = loss + rest["weight"] * (1.0 - sat_rest)
             running_sat += float(1.0 - ltn_term.detach()) * labels.size(0)  # satisfaction
             n_sat += labels.size(0)
         loss.backward()
@@ -578,23 +729,33 @@ def run_comparison(data: Dict, n_splits: int, epochs: int) -> Dict[str, List[Dic
     # validation fold never ends up all-NST or all-ST (which gave auroc=nan before).
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
     splits = list(sgkf.split(data["x_spectrograms"], data["y_labels"], groups=data["x_subjects"]))
+    # Keep the ORIGINAL fold number with each split so a dev subset reproduces the
+    # exact per-fold seeds (torch.manual_seed(SEED + fold)) of a full run.
+    fold_items = list(enumerate(splits, 1))
+    if DEV_FOLDS:
+        fold_items = [fold_items[i - 1] for i in DEV_FOLDS]
+        print(f"\n*** DEV MODE: running folds {DEV_FOLDS} of {n_splits} ***")
 
-    # LTN context (physiological axiom indices + weight), applied to the NSA arm only.
+    # LTN context (axiom indices, lambda, k, KB composition), NSA arm only.
     ltn_ctx = None
     if USE_LTN:
-        ltn_ctx = {"idxs": build_axiom_indices(data["hrv_feature_names"]), "weight": LTN_WEIGHT}
+        ltn_ctx = {"idxs": build_axiom_indices(data["hrv_feature_names"]),
+                   "weight": LTN_WEIGHT, "k": LTN_K,
+                   "bidirectional": KB_MODE in ("bi", "biw"),
+                   "use_weights": KB_MODE in ("w", "biw")}
 
     print(f"\n{'='*60}\n Subject-independent {n_splits}-fold StratifiedGroupKFold")
     print(f" Subjects: {n_subjects} | Windows: {len(data['y_labels'])} | Device: {device}")
     print(f" NSA layer: hrv_branch={USE_HRV_BRANCH} rule={USE_RULE_ENGINE} "
-          f"handover={USE_HANDOVER} | LTN={USE_LTN} (lambda={LTN_WEIGHT})\n{'='*60}")
+          f"handover={USE_HANDOVER} | LTN={USE_LTN} "
+          f"(KB={KB_MODE}, lambda={LTN_WEIGHT}, k={LTN_K})\n{'='*60}")
 
     results = {"nn": [], "nsa": []}
     # SUPPLEMENTARY subject-level results (kept SEPARATE from window-level `results`).
     subject_results = {"nn": [], "nsa": []}
     # Raw per-fold data for the figures (probabilities, labels, loss curves).
     plot_log = {"nn": [], "nsa": []}
-    for fold, (train_idx, val_idx) in enumerate(splits, 1):
+    for fold, (train_idx, val_idx) in fold_items:
         train_subj = set(data["x_subjects"][train_idx])
         val_subj = set(data["x_subjects"][val_idx])
         assert train_subj.isdisjoint(val_subj), "LEAKAGE: subject in both train and val!"
@@ -603,13 +764,84 @@ def run_comparison(data: Dict, n_splits: int, epochs: int) -> Dict[str, List[Dic
               f"| val class balance: {np.bincount(val_labels, minlength=2).tolist()} ---")
 
         # Per-fold HRV standardization (train stats only) -> stable hybrid branch.
-        fold_dataset = RealECGDataset(standardize_hrv_per_fold(data, train_idx))
+        fold_scaled = standardize_hrv_per_fold(data, train_idx)
+
+        # Label-scarcity: keep CE labels for a stratified fraction of TRAIN subjects
+        # only; other training windows get label -1 (ignored by the CE, still used by
+        # the label-free LTN term). Validation labels are untouched.
+        if LABEL_FRACTION < 1.0:
+            rng = np.random.RandomState(SEED + fold)
+            tr_sub = data["x_subjects"][train_idx]
+            tr_lab = data["y_labels"][train_idx]
+            labeled = set()
+            for cls in (0, 1):
+                subs = sorted(set(tr_sub[tr_lab == cls]))
+                n_keep = max(1, int(round(LABEL_FRACTION * len(subs))))
+                labeled.update(rng.choice(subs, size=n_keep, replace=False))
+            unlabeled_train = np.zeros(len(data["y_labels"]), dtype=bool)
+            unlabeled_train[train_idx] = np.array([s not in labeled for s in tr_sub])
+            y_masked = data["y_labels"].copy()
+            y_masked[unlabeled_train] = -1
+            fold_scaled = dict(fold_scaled)
+            fold_scaled["y_labels"] = y_masked
+            print(f"  label-scarcity: {len(labeled)}/{len(set(tr_sub))} train subjects "
+                  f"labeled ({int(LABEL_FRACTION*100)}%), "
+                  f"{int(unlabeled_train.sum())} unlabeled windows")
+
+        fold_dataset = RealECGDataset(fold_scaled)
+
+        # Empirical validation of the LTN knowledge base on the TRAIN fold only:
+        # each axiom is weighted by how much signal its predicate carries here
+        # (w = clip(2*(train AUROC - 0.5), 0, 1); a data-refuted axiom is silenced).
+        if ltn_ctx is not None and ltn_ctx["use_weights"]:
+            # Under label scarcity, validate the KB on the LABELED train windows only
+            # (fold_scaled labels equal the full labels when LABEL_FRACTION == 1.0).
+            lab_tr = fold_scaled["y_labels"][train_idx]
+            sel = lab_tr >= 0
+            ltn_ctx["weights"] = axiom_weights(
+                fold_scaled["x_hrv"][train_idx][sel],
+                fold_scaled["x_baselines"][train_idx][sel],
+                lab_tr[sel], ltn_ctx["idxs"], k=ltn_ctx["k"])
+            print(f"  LTN axiom weights (train-validated): "
+                  f"{ {k: round(v, 2) for k, v in ltn_ctx['weights'].items()} }")
+        elif ltn_ctx is not None:
+            ltn_ctx["weights"] = None    # unweighted KB ('old' / 'bi' modes)
+
+        # REST axiom: unlabeled Training-1 windows of TRAIN subjects only, standardized
+        # with the fold's TRAIN statistics (identical imputation+scaler as the windows).
+        if ltn_ctx is not None and REST_AXIOM:
+            if data.get("x_rest_hrv") is None:
+                raise SystemExit("NSA_REST=1 requires the '_rest' cache "
+                                 "(rerun so preprocessing regenerates it).")
+            med = np.nanmedian(data["x_hrv"][train_idx], axis=0)
+            med = np.where(np.isfinite(med), med, 0.0)
+            imp = np.nan_to_num(np.where(np.isnan(data["x_hrv"]), med, data["x_hrv"]))
+            mu = imp[train_idx].mean(axis=0)
+            sd = imp[train_idx].std(axis=0) + 1e-6
+            rmask = np.isin(data["x_rest_subjects"], list(train_subj))
+            rh = np.nan_to_num(np.where(np.isnan(data["x_rest_hrv"]), med, data["x_rest_hrv"]))
+            rb = np.nan_to_num(np.where(np.isnan(data["x_rest_baselines"]), med,
+                                        data["x_rest_baselines"]))
+            rest_x = (data["x_rest_spectrograms"] if BACKBONE == "seecg"
+                      else data["x_rest_windows"][:, None, :])
+            ltn_ctx["rest"] = {
+                "x": torch.tensor(np.asarray(rest_x)[rmask], dtype=torch.float32),
+                "hrv": torch.tensor(((rh - mu) / sd)[rmask], dtype=torch.float32),
+                "base": torch.tensor(((rb - mu) / sd)[rmask], dtype=torch.float32),
+                "weight": REST_WEIGHT,
+            }
+            print(f"  REST axiom: {int(rmask.sum())} unlabeled rest windows "
+                  f"(train subjects only, weight={REST_WEIGHT})")
+        elif ltn_ctx is not None:
+            ltn_ctx["rest"] = None
         train_loader = DataLoader(Subset(fold_dataset, train_idx), batch_size=BATCH_SIZE, shuffle=True)
         val_loader = DataLoader(Subset(fold_dataset, val_idx), batch_size=BATCH_SIZE, shuffle=False)
 
         # Class-weighted loss (inverse frequency from the TRAIN fold) to counter the
-        # positive-class over-prediction bias. Weights come from train labels only.
-        train_labels = data["y_labels"][train_idx]
+        # positive-class over-prediction bias. Weights come from LABELED train windows
+        # only (all of them when LABEL_FRACTION == 1.0).
+        train_labels = fold_scaled["y_labels"][train_idx]
+        train_labels = train_labels[train_labels >= 0]
         counts = np.bincount(train_labels, minlength=2).astype(np.float64)
         class_weights = counts.sum() / (2.0 * np.clip(counts, 1.0, None))
         weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
@@ -617,7 +849,8 @@ def run_comparison(data: Dict, n_splits: int, epochs: int) -> Dict[str, List[Dic
         for model_type in ("nn", "nsa"):
             torch.manual_seed(SEED + fold)  # same init seed per fold for both models
             model = build_model(model_type, data).to(device)
-            criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+            # ignore_index=-1: unlabeled windows (label-scarcity mode) carry no CE.
+            criterion = nn.CrossEntropyLoss(weight=weight_tensor, ignore_index=-1)
             optimizer = torch.optim.Adam(model.parameters(), lr=LR)
             scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[LR_DROP_EPOCH], gamma=0.1)
 
@@ -742,8 +975,11 @@ if __name__ == "__main__":
 
     # Cache keyed by subject count. 'rawhrv' = UN-imputed HRV (NaN kept) for leakage-free
     # per-fold imputation; 'raw1d' = also stores the raw 1D ECG window for the CNN-BiLSTM
-    # backbone. This new tag will not reuse the old cache, so the dataset is reprocessed once.
+    # backbone; '_rest' = additionally stores the unlabeled Training-1 rest windows for
+    # the LTN rest axiom (regenerated once when NSA_REST=1; other runs keep the old cache).
     cache_path = f"processed_real_dataset_{len(subjects)}subj_rawhrv_raw1d.pkl"
+    if REST_AXIOM:
+        cache_path = f"processed_real_dataset_{len(subjects)}subj_rawhrv_raw1d_rest.pkl"
     data = load_and_cache_dataset(BASE_DATASET_DIR, subjects, cache_path)
     results, subject_results = run_comparison(data, n_splits=N_SPLITS, epochs=EPOCHS)
     summarize(results)                          # PRIMARY window-level analysis (unchanged)
